@@ -1,0 +1,40 @@
+# Environment files
+.env
+*.env.local
+
+# WireGuard keys
+vpn-router/config/wireguard/wg0.conf
+vpn-router/config/wireguard/*.key
+
+# Cloudflare credentials
+cloudflared/credentials.json
+cloudflared/config.yml
+
+# Docker
+.docker/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Dependencies
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Build outputs
+build/
+dist/
+*.egg-info/
