@@ -2,16 +2,18 @@
 .env
 *.env.local
 
-# WireGuard keys
+# WireGuard config (contains secrets)
 vpn-router/config/wireguard/wg0.conf
-vpn-router/config/wireguard/*.key
 
-# Cloudflare credentials
-cloudflared/credentials.json
-cloudflared/config.yml
+# Node modules
+node_modules/
+*/node_modules/
 
-# Docker
-.docker/
+# Build outputs
+build/
+dist/
+*.pyc
+__pycache__/
 
 # IDE
 .vscode/
@@ -27,14 +29,10 @@ Thumbs.db
 *.log
 logs/
 
-# Dependencies
-node_modules/
-__pycache__/
-*.pyc
-.venv/
-venv/
+# Docker
+.docker/
 
-# Build outputs
-build/
-dist/
-*.egg-info/
+# Temporary
+tmp/
+temp/
+

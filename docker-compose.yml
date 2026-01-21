@@ -15,7 +15,10 @@ services:
   # VPN Router with Native Kyber-1024 Support
   # ===========================================================================
   vpn-router:
-    image: ghcr.io/vinzabe/abejar-pqc-kyber:latest
+    build:
+      context: ./vpn-router
+      dockerfile: Dockerfile
+    image: abejar-pqc-kyber:latest
     container_name: vpn-router
     hostname: vpn-router
     cap_add:
@@ -64,7 +67,10 @@ services:
   # Cloudflare Tunnel with PQC TLS
   # ===========================================================================
   cloudflared:
-    image: ghcr.io/vinzabe/abejar-cloudflared-pqc:latest
+    build:
+      context: ./cloudflared
+      dockerfile: Dockerfile
+    image: abejar-cloudflared-pqc:latest
     container_name: cloudflare-tunnel
     # Route tunnel traffic through VPN for complete anonymity
     network_mode: "service:vpn-router"
