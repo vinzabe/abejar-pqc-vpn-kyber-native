@@ -1,0 +1,529 @@
+#!/bin/bash
+#
+# VPN Container Manager v2.0
+# Automatically routes containers through AirVPN
+#
+# Usage: vpn-container add <container_name> <port>
+#        vpn-container remove <container_name>
+#        vpn-container list
+#        vpn-container status
+
+set -e
+
+VPN_CONTAINER="airvpn-wg"
+SCRIPT_NAME=$(basename "$0")
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
+log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
+log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+
+usage() {
+    cat << USAGE
+${BOLD}VPN Container Manager v2.0${NC} - Route containers through AirVPN
+
+${CYAN}Usage:${NC} $SCRIPT_NAME <command> [arguments]
+
+${CYAN}Commands:${NC}
+  add <container> <port>    Add container to VPN and expose port
+  remove <container>        Remove container from VPN network
+  list                      List all containers using VPN
+  status                    Show VPN status, IP, and available ports
+  test <container>          Test outbound IP of a container
+  ports                     Show used and available ports
+
+${CYAN}Examples:${NC}
+  $SCRIPT_NAME add my-webapp 3000
+  $SCRIPT_NAME add redis-cache 6379
+  $SCRIPT_NAME list
+  $SCRIPT_NAME test my-webapp
+
+${CYAN}Notes:${NC}
+  - Ports are automatically added to VPN container if not available
+  - Container will be recreated with VPN network namespace
+  - Access your service via localhost:<port> in Cloudflare Tunnel
+
+USAGE
+    exit 1
+}
+
+check_docker() {
+    if ! command -v docker &> /dev/null; then
+        log_error "Docker is not installed or not in PATH"
+        exit 1
+    fi
+}
+
+check_vpn_container() {
+    if ! docker ps --format '{{.Names}}' | grep -q "^${VPN_CONTAINER}$"; then
+        log_error "VPN container '${VPN_CONTAINER}' is not running!"
+        log_info "Start it with: docker start ${VPN_CONTAINER}"
+        exit 1
+    fi
+}
+
+get_vpn_ip() {
+    docker exec "$VPN_CONTAINER" curl -4 -s --max-time 5 ifconfig.me 2>/dev/null || echo "Unable to fetch"
+}
+
+get_vpn_container_id() {
+    docker inspect "$VPN_CONTAINER" --format '{{.Id}}' 2>/dev/null
+}
+
+is_port_exposed() {
+    local port="$1"
+    docker port "$VPN_CONTAINER" 2>/dev/null | grep -q ":${port}$" || \
+    docker port "$VPN_CONTAINER" 2>/dev/null | grep -q "^${port}/tcp"
+}
+
+is_port_in_use() {
+    local port="$1"
+    # Check if something is listening on this port on the host
+    ss -tlnp 2>/dev/null | grep -q ":${port} " && return 0
+    # Check if any container is using this port
+    docker ps --format '{{.Ports}}' | grep -q "0.0.0.0:${port}->\|127.0.0.1:${port}->" && return 0
+    return 1
+}
+
+get_used_ports() {
+    docker port "$VPN_CONTAINER" 2>/dev/null | grep "127.0.0.1:" | sed 's/.*127.0.0.1:\([0-9]*\).*/\1/' | sort -n | uniq
+}
+
+add_port_to_vpn() {
+    local port="$1"
+    
+    log_info "Port $port not available on VPN container. Adding it now..."
+    
+    # Get current VPN container config
+    local IMAGE=$(docker inspect "$VPN_CONTAINER" --format '{{.Config.Image}}')
+    local RESTART=$(docker inspect "$VPN_CONTAINER" --format '{{.HostConfig.RestartPolicy.Name}}')
+    
+    # Get all current port mappings
+    local CURRENT_PORTS=$(docker inspect "$VPN_CONTAINER" --format '{{range $p, $conf := .HostConfig.PortBindings}}{{range $conf}}-p {{.HostIp}}:{{.HostPort}}:{{$p}} {{end}}{{end}}' | sed 's/:::/0.0.0.0:/g' | sed 's/-p :/\n-p 0.0.0.0:/g')
+    
+    # Get volumes
+    local VOLUMES=$(docker inspect "$VPN_CONTAINER" --format '{{range .Mounts}}-v {{.Source}}:{{.Destination}}{{if .RW}}{{else}}:ro{{end}} {{end}}')
+    
+    # Get environment variables
+    local ENV_VARS=$(docker inspect "$VPN_CONTAINER" --format '{{range .Config.Env}}-e "{{.}}" {{end}}')
+    
+    # Get capabilities
+    local CAPS=$(docker inspect "$VPN_CONTAINER" --format '{{range .HostConfig.CapAdd}}--cap-add {{.}} {{end}}')
+    
+    # Get sysctls
+    local SYSCTLS=$(docker inspect "$VPN_CONTAINER" --format '{{range $k, $v := .HostConfig.Sysctls}}--sysctl {{$k}}={{$v}} {{end}}')
+    
+    # Get privileged mode
+    local PRIVILEGED=""
+    if [[ $(docker inspect "$VPN_CONTAINER" --format '{{.HostConfig.Privileged}}') == "true" ]]; then
+        PRIVILEGED="--privileged"
+    fi
+    
+    # Get network
+    local NETWORK=$(docker inspect "$VPN_CONTAINER" --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}' | head -1)
+    
+    # Find containers using this VPN container's network
+    local VPN_ID=$(get_vpn_container_id)
+    local DEPENDENT_CONTAINERS=$(docker ps -a --format '{{.Names}}' | while read c; do
+        local nm=$(docker inspect "$c" --format '{{.HostConfig.NetworkMode}}' 2>/dev/null)
+        if [[ "$nm" == "container:$VPN_ID" ]] || [[ "$nm" == "container:$VPN_CONTAINER" ]]; then
+            echo "$c"
+        fi
+    done)
+    
+    # Stop dependent containers first
+    if [[ -n "$DEPENDENT_CONTAINERS" ]]; then
+        log_info "Stopping dependent containers..."
+        for c in $DEPENDENT_CONTAINERS; do
+            docker stop "$c" >/dev/null 2>&1 || true
+        done
+    fi
+    
+    # Stop and remove VPN container
+    log_info "Recreating VPN container with new port..."
+    docker stop "$VPN_CONTAINER" >/dev/null 2>&1 || true
+    docker rm "$VPN_CONTAINER" >/dev/null 2>&1 || true
+    
+    # Build new run command with additional port
+    local RUN_CMD="docker run -d --name $VPN_CONTAINER"
+    [[ -n "$NETWORK" ]] && RUN_CMD="$RUN_CMD --network $NETWORK"
+    [[ -n "$RESTART" && "$RESTART" != "no" ]] && RUN_CMD="$RUN_CMD --restart $RESTART"
+    [[ -n "$PRIVILEGED" ]] && RUN_CMD="$RUN_CMD $PRIVILEGED"
+    [[ -n "$CAPS" ]] && RUN_CMD="$RUN_CMD $CAPS"
+    [[ -n "$SYSCTLS" ]] && RUN_CMD="$RUN_CMD $SYSCTLS"
+    
+    # Add existing ports
+    RUN_CMD="$RUN_CMD $CURRENT_PORTS"
+    
+    # Add new port
+    RUN_CMD="$RUN_CMD -p 127.0.0.1:${port}:${port}"
+    
+    # Add volumes and env
+    [[ -n "$VOLUMES" ]] && RUN_CMD="$RUN_CMD $VOLUMES"
+    
+    # Add env vars (escape properly)
+    while IFS= read -r env; do
+        [[ -n "$env" ]] && RUN_CMD="$RUN_CMD $env"
+    done <<< "$(docker inspect "$VPN_CONTAINER" --format '{{range .Config.Env}}-e {{.}}
+{{end}}' 2>/dev/null || true)"
+    
+    RUN_CMD="$RUN_CMD $IMAGE"
+    
+    # Run new container
+    eval "$RUN_CMD" >/dev/null 2>&1
+    
+    # Wait for VPN to establish
+    log_info "Waiting for VPN connection..."
+    sleep 5
+    
+    # Start dependent containers
+    if [[ -n "$DEPENDENT_CONTAINERS" ]]; then
+        log_info "Starting dependent containers..."
+        for c in $DEPENDENT_CONTAINERS; do
+            docker start "$c" >/dev/null 2>&1 || true
+        done
+    fi
+    
+    log_success "Port $port added to VPN container"
+}
+
+cmd_status() {
+    check_docker
+    check_vpn_container
+    
+    echo -e "\n${BOLD}${BLUE}=== VPN Container Status ===${NC}\n"
+    
+    VPN_IP=$(get_vpn_ip)
+    VPN_CONTAINER_ID=$(get_vpn_container_id | cut -c1-12)
+    
+    echo -e "${CYAN}VPN Container:${NC}  $VPN_CONTAINER ($VPN_CONTAINER_ID)"
+    echo -e "${CYAN}VPN Exit IP:${NC}    ${GREEN}${BOLD}$VPN_IP${NC}"
+    echo -e "${CYAN}Status:${NC}         $(docker inspect "$VPN_CONTAINER" --format '{{.State.Status}}')"
+    
+    # WireGuard interface
+    echo -e "\n${CYAN}WireGuard:${NC}"
+    docker exec "$VPN_CONTAINER" ip addr show wg0 2>/dev/null | grep "inet " | awk '{print "  Internal IP: "$2}'
+    
+    # Ports
+    echo -e "\n${CYAN}Exposed Ports (localhost):${NC}"
+    docker port "$VPN_CONTAINER" 2>/dev/null | grep "127.0.0.1:" | while read line; do
+        PORT=$(echo "$line" | sed 's/.*127.0.0.1:\([0-9]*\).*/\1/')
+        echo "  - localhost:$PORT"
+    done
+    
+    echo ""
+}
+
+cmd_ports() {
+    check_docker
+    check_vpn_container
+    
+    echo -e "\n${BOLD}${BLUE}=== Port Status ===${NC}\n"
+    
+    echo -e "${CYAN}Used Ports:${NC}"
+    docker port "$VPN_CONTAINER" 2>/dev/null | grep "127.0.0.1:" | while read line; do
+        PORT=$(echo "$line" | sed 's/.*127.0.0.1:\([0-9]*\).*/\1/')
+        INTERNAL=$(echo "$line" | cut -d'/' -f1)
+        echo "  localhost:$PORT -> container:$INTERNAL"
+    done
+    
+    echo -e "\n${CYAN}Note:${NC} Any port can be added automatically when you run:"
+    echo "  $SCRIPT_NAME add <container> <port>"
+    echo ""
+}
+
+cmd_list() {
+    check_docker
+    check_vpn_container
+    
+    VPN_CONTAINER_ID=$(get_vpn_container_id)
+    VPN_IP=$(get_vpn_ip)
+    
+    echo -e "\n${BOLD}${BLUE}=== Containers Using VPN ===${NC}\n"
+    echo -e "${CYAN}VPN Exit IP: ${GREEN}${BOLD}$VPN_IP${NC}\n"
+    
+    printf "${BOLD}%-25s %-12s %-18s %-15s${NC}\n" "CONTAINER" "STATUS" "PORT" "OUTBOUND IP"
+    printf "%-25s %-12s %-18s %-15s\n" "─────────" "──────" "────" "───────────"
+    
+    docker ps -a --format '{{.Names}}' | while read container; do
+        NETWORK_MODE=$(docker inspect "$container" --format '{{.HostConfig.NetworkMode}}' 2>/dev/null)
+        if [[ "$NETWORK_MODE" == "container:$VPN_CONTAINER_ID" ]] || [[ "$NETWORK_MODE" == "container:$VPN_CONTAINER" ]]; then
+            STATUS=$(docker inspect "$container" --format '{{.State.Status}}')
+            
+            # Find which port this container uses
+            PORT="-"
+            
+            if [[ "$STATUS" == "running" ]]; then
+                IP=$(docker exec "$container" curl -4 -s --max-time 3 ifconfig.me 2>/dev/null || echo "N/A")
+            else
+                IP="-"
+            fi
+            
+            if [[ "$STATUS" == "running" ]]; then
+                STATUS="${GREEN}running${NC}"
+            else
+                STATUS="${RED}$STATUS${NC}"
+            fi
+            
+            printf "%-25s %-23b %-18s %-15s\n" "$container" "$STATUS" "$PORT" "$IP"
+        fi
+    done
+    
+    echo ""
+}
+
+cmd_test() {
+    local container="$1"
+    
+    if [[ -z "$container" ]]; then
+        log_error "Container name required"
+        echo "Usage: $SCRIPT_NAME test <container_name>"
+        exit 1
+    fi
+    
+    check_docker
+    
+    if ! docker ps --format '{{.Names}}' | grep -q "^${container}$"; then
+        log_error "Container '$container' is not running"
+        exit 1
+    fi
+    
+    log_info "Testing outbound IP for '$container'..."
+    
+    IP=$(docker exec "$container" curl -4 -s --max-time 10 ifconfig.me 2>/dev/null)
+    
+    if [[ -n "$IP" ]]; then
+        VPN_IP=$(get_vpn_ip)
+        echo ""
+        if [[ "$IP" == "$VPN_IP" ]]; then
+            echo -e "${GREEN}${BOLD}✓ Container is using VPN${NC}"
+            echo -e "  Outbound IP: ${BOLD}$IP${NC}"
+        else
+            echo -e "${YELLOW}${BOLD}⚠ Container is NOT using VPN${NC}"
+            echo -e "  Container IP: $IP"
+            echo -e "  VPN IP:       $VPN_IP"
+        fi
+        echo ""
+    else
+        log_error "Could not determine outbound IP"
+        log_info "Container may not have curl installed"
+    fi
+}
+
+cmd_add() {
+    local container="$1"
+    local port="$2"
+    
+    if [[ -z "$container" ]] || [[ -z "$port" ]]; then
+        log_error "Container name and port required"
+        echo "Usage: $SCRIPT_NAME add <container_name> <port>"
+        exit 1
+    fi
+    
+    check_docker
+    check_vpn_container
+    
+    # Validate port
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || [[ "$port" -lt 1 ]] || [[ "$port" -gt 65535 ]]; then
+        log_error "Invalid port: $port (must be 1-65535)"
+        exit 1
+    fi
+    
+    # Check if container exists
+    if ! docker ps -a --format '{{.Names}}' | grep -q "^${container}$"; then
+        log_error "Container '$container' not found"
+        log_info "Available containers:"
+        docker ps -a --format '  - {{.Names}} ({{.Status}})' | head -10
+        exit 1
+    fi
+    
+    # Check if already using VPN
+    VPN_CONTAINER_ID=$(get_vpn_container_id)
+    CURRENT_NETWORK=$(docker inspect "$container" --format '{{.HostConfig.NetworkMode}}' 2>/dev/null)
+    
+    if [[ "$CURRENT_NETWORK" == "container:$VPN_CONTAINER_ID" ]] || [[ "$CURRENT_NETWORK" == "container:$VPN_CONTAINER" ]]; then
+        log_warn "Container '$container' is already using VPN network"
+        VPN_IP=$(get_vpn_ip)
+        echo ""
+        echo -e "${CYAN}════════════════════════════════════════════${NC}"
+        echo -e "${GREEN}${BOLD}Container already on VPN${NC}"
+        echo -e "${CYAN}════════════════════════════════════════════${NC}"
+        echo -e "  Container:    $container"
+        echo -e "  Exit IP:      ${BOLD}$VPN_IP${NC}"
+        echo -e "${CYAN}════════════════════════════════════════════${NC}"
+        echo ""
+        exit 0
+    fi
+    
+    # Check if port is already in use by another service
+    if is_port_in_use "$port"; then
+        # Check if it's used by VPN container (that's OK)
+        if ! docker port "$VPN_CONTAINER" 2>/dev/null | grep -q "127.0.0.1:${port}->"; then
+            log_error "Port $port is already in use by another service!"
+            echo ""
+            echo "Used by:"
+            ss -tlnp 2>/dev/null | grep ":${port} " | head -3
+            echo ""
+            log_info "Choose a different port"
+            exit 1
+        fi
+    fi
+    
+    # Check if port is available on VPN container, if not add it
+    if ! is_port_exposed "$port"; then
+        add_port_to_vpn "$port"
+    fi
+    
+    log_info "Adding '$container' to VPN network on port $port..."
+    
+    # Get container info
+    IMAGE=$(docker inspect "$container" --format '{{.Config.Image}}')
+    RESTART_POLICY=$(docker inspect "$container" --format '{{.HostConfig.RestartPolicy.Name}}')
+    
+    # Get volumes
+    VOLUMES=""
+    while IFS= read -r mount; do
+        [[ -n "$mount" ]] && VOLUMES="$VOLUMES $mount"
+    done <<< "$(docker inspect "$container" --format '{{range .Mounts}}-v {{.Source}}:{{.Destination}}{{if .RW}}{{else}}:ro{{end}}
+{{end}}')"
+    
+    # Get environment variables
+    ENV_ARGS=""
+    while IFS= read -r env; do
+        [[ -n "$env" && ! "$env" =~ ^PATH= && ! "$env" =~ ^HOSTNAME= && ! "$env" =~ ^HOME= ]] && ENV_ARGS="$ENV_ARGS -e \"$env\""
+    done <<< "$(docker inspect "$container" --format '{{range .Config.Env}}{{.}}
+{{end}}')"
+    
+    # Get working directory
+    WORKDIR=$(docker inspect "$container" --format '{{.Config.WorkingDir}}')
+    
+    # Get labels
+    LABELS=""
+    while IFS= read -r label; do
+        [[ -n "$label" ]] && LABELS="$LABELS --label \"$label\""
+    done <<< "$(docker inspect "$container" --format '{{range $k, $v := .Config.Labels}}{{$k}}={{$v}}
+{{end}}')"
+    
+    # Stop and remove container
+    log_info "Stopping container..."
+    docker stop "$container" >/dev/null 2>&1 || true
+    
+    log_info "Removing container..."
+    docker rm "$container" >/dev/null 2>&1
+    
+    # Build docker run command
+    RUN_CMD="docker run -d --name $container"
+    RUN_CMD="$RUN_CMD --network container:$VPN_CONTAINER"
+    
+    [[ -n "$RESTART_POLICY" && "$RESTART_POLICY" != "no" ]] && RUN_CMD="$RUN_CMD --restart $RESTART_POLICY"
+    [[ -n "$VOLUMES" ]] && RUN_CMD="$RUN_CMD $VOLUMES"
+    [[ -n "$WORKDIR" ]] && RUN_CMD="$RUN_CMD -w \"$WORKDIR\""
+    [[ -n "$ENV_ARGS" ]] && RUN_CMD="$RUN_CMD $ENV_ARGS"
+    
+    RUN_CMD="$RUN_CMD $IMAGE"
+    
+    # Recreate container
+    log_info "Recreating container with VPN network..."
+    eval "$RUN_CMD" >/dev/null 2>&1
+    
+    # Wait for container to start
+    sleep 3
+    
+    # Verify
+    if docker ps --format '{{.Names}}' | grep -q "^${container}$"; then
+        VPN_IP=$(get_vpn_ip)
+        NEW_IP=$(docker exec "$container" curl -4 -s --max-time 5 ifconfig.me 2>/dev/null || echo "$VPN_IP")
+        
+        echo ""
+        echo -e "${CYAN}════════════════════════════════════════════════════════════${NC}"
+        echo -e "${GREEN}${BOLD}✓ SUCCESS - Container added to VPN${NC}"
+        echo -e "${CYAN}════════════════════════════════════════════════════════════${NC}"
+        echo -e "  ${BOLD}Container:${NC}      $container"
+        echo -e "  ${BOLD}Exit IP:${NC}        ${GREEN}$NEW_IP${NC}"
+        echo -e "  ${BOLD}Access URL:${NC}     ${YELLOW}http://localhost:$port${NC}"
+        echo -e "${CYAN}════════════════════════════════════════════════════════════${NC}"
+        echo -e "  ${BOLD}Cloudflare Tunnel Config:${NC}"
+        echo -e "    Hostname:  your-domain.com"
+        echo -e "    Service:   ${YELLOW}http://localhost:$port${NC}"
+        echo -e "${CYAN}════════════════════════════════════════════════════════════${NC}"
+        echo ""
+    else
+        log_error "Failed to start container!"
+        echo "Check logs: docker logs $container"
+        exit 1
+    fi
+}
+
+cmd_remove() {
+    local container="$1"
+    
+    if [[ -z "$container" ]]; then
+        log_error "Container name required"
+        echo "Usage: $SCRIPT_NAME remove <container_name>"
+        exit 1
+    fi
+    
+    check_docker
+    
+    if ! docker ps -a --format '{{.Names}}' | grep -q "^${container}$"; then
+        log_error "Container '$container' not found"
+        exit 1
+    fi
+    
+    # Check if using VPN
+    VPN_CONTAINER_ID=$(get_vpn_container_id)
+    CURRENT_NETWORK=$(docker inspect "$container" --format '{{.HostConfig.NetworkMode}}' 2>/dev/null)
+    
+    if [[ "$CURRENT_NETWORK" != "container:$VPN_CONTAINER_ID" ]] && [[ "$CURRENT_NETWORK" != "container:$VPN_CONTAINER" ]]; then
+        log_warn "Container '$container' is not using VPN network"
+        exit 0
+    fi
+    
+    log_info "To remove '$container' from VPN, recreate it with original network settings"
+    log_info "Or use docker-compose to manage the container"
+    echo ""
+    echo "Manual steps:"
+    echo "  1. docker stop $container"
+    echo "  2. docker rm $container"  
+    echo "  3. Recreate without --network container:$VPN_CONTAINER"
+    echo ""
+}
+
+# Main
+check_docker
+
+case "${1:-}" in
+    add)
+        cmd_add "$2" "$3"
+        ;;
+    remove)
+        cmd_remove "$2"
+        ;;
+    list)
+        cmd_list
+        ;;
+    status)
+        cmd_status
+        ;;
+    ports)
+        cmd_ports
+        ;;
+    test)
+        cmd_test "$2"
+        ;;
+    -h|--help|help)
+        usage
+        ;;
+    *)
+        usage
+        ;;
+esac
