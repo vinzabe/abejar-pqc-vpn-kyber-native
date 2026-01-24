@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run ShellCheck
+        uses: ludeeus/action-shellcheck@master
+        with:
+          scandir: './scripts'
+          additional_files: 'vpn-router/healthcheck.sh cloudflared/entrypoint.sh'
+          severity: warning
+
+      - name: Lint YAML files
+        uses: ibiqlik/action-yamllint@v3
+        with:
+          file_or_dir: |
+            docker-compose.yml
+            .github/workflows/*.yml
+          config_data: |
+            extends: default
+            rules:
+              line-length:
+                max: 150
+                level: warning
+              truthy:
+                check-keys: false
+
+  docker-build:
+    name: Docker Build Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build VPN Router
+        uses: docker/build-push-action@v5
+        with:
+          context: ./vpn-router
+          file: ./vpn-router/Dockerfile
+          push: false
+          tags: abejar-pqc-kyber:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build Cloudflared
+        uses: docker/build-push-action@v5
+        with:
+          context: ./cloudflared
+          file: ./cloudflared/Dockerfile
+          push: false
+          tags: abejar-cloudflared-pqc:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  compose-validate:
+    name: Docker Compose Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate docker-compose.yml
+        run: |
+          cp .env.example .env
+          docker compose config --quiet
+
+      - name: Validate example compose files
+        run: |
+          for dir in examples/*/; do
+            if [ -f "$dir/docker-compose.yml" ]; then
+              echo "Validating $dir/docker-compose.yml"
+              if [ -f "$dir/.env.example" ]; then
+                cp "$dir/.env.example" "$dir/.env"
+              fi
+              docker compose -f "$dir/docker-compose.yml" config --quiet || true
+            fi
+          done
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'config'
+          scan-ref: '.'
+          format: 'table'
+          exit-code: '0'
+          severity: 'HIGH,CRITICAL'
